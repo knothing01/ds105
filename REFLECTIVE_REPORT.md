@@ -1,0 +1,31 @@
+# Reflective Report — Hotel Reservation System (Phase 3)
+
+## Project Overview
+
+The goal of this project was to design and implement a fully functional, database-driven Hotel Reservation System that mirrors a real-world booking platform. The system supports the complete reservation lifecycle — customers search hotels, book overnight or meeting rooms, pay, receive invoices, and leave reviews — while administrators manage hotels, employees, and analytics through a dedicated dashboard. The application follows a three-tier architecture: PostgreSQL as the data layer, a Node.js/Express REST API as the application layer, and a React/Vite single-page application as the presentation layer.
+
+## Schema Design and Normalization
+
+The schema was normalized to Third Normal Form and follows the ERD exactly. The most instructive design decision was the supertype/subtype pattern: a single `users` table holds common identity fields, while `customers`, `employees`, and `admins` are separate subtypes with their own PKs and a one-to-one FK back to `users`. This eliminated redundant columns and made role detection at login a matter of LEFT JOINing all three subtypes and checking which one returned a row.
+
+A deliberate departure from a naive design was the `services` table, whose primary key is the composite `(hotel_id, service_name)` rather than a surrogate serial. This reflects the real business constraint that a service name is unique within a hotel, and it propagates naturally into `reservation_services(reservation_id, hotel_id, service_name)`, making the relationship self-describing without any surrogate keys. Similarly, `overnight_rooms` and `meeting_rooms` both use composite PKs `(room_number, hotel_id)`, which forced every join and availability check to carry both columns — a healthy discipline that eliminated whole classes of cross-hotel data corruption.
+
+The invoice design deserves mention: the `invoices` table stores only `discount` and `tax`; the line-item total is never stored but computed on demand by `calculate_invoice_total()`. This avoids the classic derived-data consistency problem where a stored total drifts from the underlying line items after an update.
+
+## PL/pgSQL and Advanced Database Features
+
+Writing `calculate_invoice_total()` was the most instructive PL/pgSQL exercise. The function runs four subqueries in sequence — overnight room cost (price × nights), meeting room cost (hourly rate × ceiling of hours), service charges, and the invoice's tax/discount — then combines them. Pushing this computation into the database means the correct total is returned regardless of which client calls it: API, `psql`, or a reporting tool. A companion stored procedure, `checkout_reservation()`, wraps the full check-out in a single transaction: it inserts the invoice if missing, frees the rooms, marks the reservation completed, and records the payment atomically.
+
+Two triggers reinforce the business rules at the database level. Trigger T1 (`payment_confirms_reservation`) fires after every `INSERT` or `UPDATE` on `payments`; if the new status is `approved`, it automatically moves the linked reservation from `on_hold` to `confirmed`. This means the application cannot accidentally leave a paid reservation unconfirmed. Trigger T2 (`block_user_delete_with_active_reservations`) fires before any `DELETE` on `users` and raises an exception if the user has any `on_hold` or `confirmed` reservations — preventing orphaned bookings regardless of which tool issues the delete.
+
+Three indexes were created with explicit performance justifications. `idx_login_login` on `login(login)` accelerates every authentication request, which is the most frequent query in the system. `idx_overnight_rooms_hotel_status` on `overnight_rooms(hotel_id, status)` directly supports the availability search, which filters on equality for both columns before doing any further work. `idx_invoices_reservation_id` on `invoices(reservation_id)` accelerates the join between invoices and reservations used by every reporting query. EXPLAIN ANALYZE before and after index creation confirmed that all three eliminate sequential scans in favor of index scans or bitmap index scans on the relevant hot paths.
+
+## Full-Stack Integration Lessons
+
+Bridging React and PostgreSQL surfaced several practical challenges. The first was data-type mismatch: PostgreSQL `DATE` columns arrive in the JavaScript layer as native `Date` objects via `node-postgres`, not ISO strings, so display code that called `.slice(0, 10)` silently broke. The fix was to apply `new Date(value).toISOString().slice(0, 10)` consistently at the boundary. The second was error propagation: a failed API call left the page in a permanent `Loading...` state because no `.catch()` handler was attached to the initial data-fetch promises. Adding explicit error state to each page made failures visible and debuggable. The third was schema/code drift: renaming a column (e.g., `name` → `service_name`) in SQL required updating every JOIN condition in the ORM-less controller layer — a reminder that without an abstraction layer, column renames must be tracked manually across the codebase.
+
+The seed script (`seed.py`) reinforced the value of generating realistic data programmatically. Using Python's `Faker` library for names and emails and `bcrypt` for real password hashes produced a dataset that exercised actual query paths (index lookups, availability conflicts, invoice aggregations) rather than synthetic patterns. Generating 1,000 hotels, 10,000 rooms, and 5,000 reservations also stress-tested the availability query's NOT EXISTS correlated subquery and confirmed that the composite index on `(hotel_id, status)` kept it sub-millisecond.
+
+## Conclusion
+
+The project deepened our understanding of the database as an active participant in business logic, not a passive store. PL/pgSQL triggers and functions enforce invariants that no application-layer code can bypass, composite PKs make relationships explicit and self-documenting, and targeted indexes turn analytic queries from full-table scans into fast index lookups. The main lesson for future work: define the schema's primary keys and composite constraints before writing any application code — retrofitting them later required cascading changes through every controller, every seed row, and every query.
